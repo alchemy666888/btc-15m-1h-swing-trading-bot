@@ -47,40 +47,40 @@ class LTFConditions:
     volume_confirmed: bool = False
 
     def is_long_entry_valid(self, config: dict) -> bool:
-        """Check if all long entry conditions are met"""
-        req = config['structure']['ltf_consecutive_required']
-        min_pullback = config['entry']['pullback_min']
-        max_pullback = config['entry']['pullback_max']
+        """Check if long entry conditions are met (relaxed for more signals)"""
         min_bars_above_zero = config['entry']['macd_above_zero_bars']
         min_histogram_bars = config['macd']['histogram_sequence_min']
 
-        structure_ok = self.hh_count >= req and self.hl_count >= req
+        # Core conditions: MACD crossover with positive histogram
         macd_position_ok = self.macd_above_zero_bars >= min_bars_above_zero
-        histogram_ok = self.histogram_positive_count >= min_histogram_bars and self.histogram_expanding
-        pullback_ok = min_pullback <= self.retracement_pct <= max_pullback
-        support_ok = self.at_support
+        histogram_ok = self.histogram_positive_count >= min_histogram_bars
         entry_ok = self.macd_cross_up
 
-        return (structure_ok and macd_position_ok and histogram_ok and
-                pullback_ok and support_ok and entry_ok)
+        # Structure and pullback are optional but boost confidence
+        structure_ok = (self.hh_count >= 1 or self.hl_count >= 1)
+
+        # Primary: MACD cross with histogram confirmation
+        # OR: Strong structure with MACD position
+        return (entry_ok and histogram_ok) or \
+               (macd_position_ok and histogram_ok and structure_ok and self.at_support)
 
     def is_short_entry_valid(self, config: dict) -> bool:
-        """Check if all short entry conditions are met"""
-        req = config['structure']['ltf_consecutive_required']
-        min_pullback = config['entry']['pullback_min']
-        max_pullback = config['entry']['pullback_max']
+        """Check if short entry conditions are met (relaxed for more signals)"""
         min_bars_below_zero = config['entry']['macd_above_zero_bars']
         min_histogram_bars = config['macd']['histogram_sequence_min']
 
-        structure_ok = self.lh_count >= req and self.ll_count >= req
+        # Core conditions: MACD crossover with negative histogram
         macd_position_ok = self.macd_below_zero_bars >= min_bars_below_zero
-        histogram_ok = self.histogram_negative_count >= min_histogram_bars and self.histogram_expanding
-        pullback_ok = min_pullback <= self.retracement_pct <= max_pullback
-        resistance_ok = self.at_resistance
+        histogram_ok = self.histogram_negative_count >= min_histogram_bars
         entry_ok = self.macd_cross_down
 
-        return (structure_ok and macd_position_ok and histogram_ok and
-                pullback_ok and resistance_ok and entry_ok)
+        # Structure is optional but boosts confidence
+        structure_ok = (self.lh_count >= 1 or self.ll_count >= 1)
+
+        # Primary: MACD cross with histogram confirmation
+        # OR: Strong structure with MACD position
+        return (entry_ok and histogram_ok) or \
+               (macd_position_ok and histogram_ok and structure_ok and self.at_resistance)
 
 
 class LTFTrigger:

@@ -44,36 +44,42 @@ class HTFConditions:
     price_drawdown_pct: float = 0.0
 
     def is_bullish_valid(self, config: dict) -> bool:
-        """Check if all bullish conditions are met"""
+        """Check if bullish conditions are met (relaxed)"""
         req = config['structure']['htf_consecutive_required']
-        max_drawdown = config['macd']['price_drawdown_max']
 
-        structure_ok = self.hh_count >= req and self.hl_count >= req
-        ob_ok = self.price_vs_ob == 'above_bullish'
+        # Require at least one HH and one HL for bullish bias
+        structure_ok = (self.hh_count >= 1 and self.hl_count >= 1) or \
+                       (self.hh_count >= req or self.hl_count >= req)
+
+        # MACD conditions (any one is sufficient)
         macd_ok = (
             self.reversal_signal or
             self.divergence == 1 or
-            (self.magnitude_narrowing and self.histogram_direction == -1)
+            self.magnitude_narrowing or
+            self.histogram_sequence >= 2
         )
-        drawdown_ok = self.price_drawdown_pct <= max_drawdown
 
-        return structure_ok and ob_ok and macd_ok and drawdown_ok
+        # OB is optional - boost confidence but not required
+        return structure_ok and macd_ok
 
     def is_bearish_valid(self, config: dict) -> bool:
-        """Check if all bearish conditions are met"""
+        """Check if bearish conditions are met (relaxed)"""
         req = config['structure']['htf_consecutive_required']
-        max_drawdown = config['macd']['price_drawdown_max']
 
-        structure_ok = self.lh_count >= req and self.ll_count >= req
-        ob_ok = self.price_vs_ob == 'below_bearish'
+        # Require at least one LH and one LL for bearish bias
+        structure_ok = (self.lh_count >= 1 and self.ll_count >= 1) or \
+                       (self.lh_count >= req or self.ll_count >= req)
+
+        # MACD conditions (any one is sufficient)
         macd_ok = (
             self.reversal_signal or
             self.divergence == -1 or
-            (self.magnitude_narrowing and self.histogram_direction == 1)
+            self.magnitude_narrowing or
+            self.histogram_sequence >= 2
         )
-        drawdown_ok = self.price_drawdown_pct <= max_drawdown
 
-        return structure_ok and ob_ok and macd_ok and drawdown_ok
+        # OB is optional - boost confidence but not required
+        return structure_ok and macd_ok
 
 
 class HTFFilter:

@@ -26,12 +26,12 @@ structure:
   # Higher Timeframe (1H)
   htf_lookback: 5                  # bars for swing detection
   htf_threshold: 0.005             # 0.5% minimum move for HH/HL/LH/LL
-  htf_consecutive_required: 3      # consecutive HH/HL or LH/LL required
+  htf_consecutive_required: 2      # consecutive HH/HL or LH/LL required
 
   # Lower Timeframe (15min)
   ltf_lookback: 5
   ltf_threshold: 0.003             # 0.3% minimum move
-  ltf_consecutive_required: 3
+  ltf_consecutive_required: 2
 
 # =============================================================================
 # MACD SETTINGS
@@ -40,11 +40,11 @@ macd:
   fast_period: 12
   slow_period: 26
   signal_period: 9
-  histogram_sequence_min: 4        # minimum consecutive bars
-  histogram_sequence_max: 6        # maximum for divergence check
-  magnitude_change_threshold: 0.20 # 20% bar-to-bar change
+  histogram_sequence_min: 2        # minimum consecutive bars
+  histogram_sequence_max: 10       # maximum for divergence check
+  magnitude_change_threshold: 0.10 # 10% bar-to-bar change
   divergence_threshold: 0.10       # 10% price vs MACD difference
-  price_drawdown_max: 0.01         # 1% max price move during histogram sequence
+  price_drawdown_max: 0.05         # 5% max price move during histogram sequence
 
 # =============================================================================
 # ORDER BLOCKS (Simplified)
@@ -60,10 +60,10 @@ order_blocks:
 # ENTRY TRIGGERS
 # =============================================================================
 entry:
-  pullback_min: 0.20               # 20% retracement minimum
-  pullback_max: 0.50               # 50% retracement maximum
-  macd_above_zero_bars: 3          # bars MACD must be > 0 (or < 0 for shorts)
-  volume_confirmation: 1.5         # entry volume > 1.5x average
+  pullback_min: 0.10               # 10% retracement minimum
+  pullback_max: 0.70               # 70% retracement maximum
+  macd_above_zero_bars: 2          # bars MACD must be > 0 (or < 0 for shorts)
+  volume_confirmation: 0.8         # entry volume > 0.8x average (relaxed)
 
 # =============================================================================
 # RISK MANAGEMENT

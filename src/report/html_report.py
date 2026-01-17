@@ -191,7 +191,7 @@ class HTMLReportGenerator:
             if long_entries:
                 fig.add_trace(
                     go.Scatter(
-                        x=[t['entry_date'] for t in long_entries],
+                        x=[t.get('entry_datetime', t.get('entry_date', '')) for t in long_entries],
                         y=[t['entry_price'] for t in long_entries],
                         mode='markers',
                         marker=dict(symbol='triangle-up', size=12, color='#2ecc71'),
@@ -203,7 +203,7 @@ class HTMLReportGenerator:
             if short_entries:
                 fig.add_trace(
                     go.Scatter(
-                        x=[t['entry_date'] for t in short_entries],
+                        x=[t.get('entry_datetime', t.get('entry_date', '')) for t in short_entries],
                         y=[t['entry_price'] for t in short_entries],
                         mode='markers',
                         marker=dict(symbol='triangle-down', size=12, color='#e74c3c'),

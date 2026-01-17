@@ -202,22 +202,27 @@ class StructureAnalyzer(bt.Indicator):
     def _check_structure_break(self):
         """Check for structure invalidation (break)"""
         current_close = self.data.close[0]
+        threshold = self.p.threshold
 
-        # Bearish structure break: Close below last swing low
+        # Bearish structure break: Close significantly below last swing low
         if self._last_swing_low is not None:
-            if current_close < self._last_swing_low:
+            break_pct = (self._last_swing_low - current_close) / self._last_swing_low
+            if break_pct > threshold:  # Only break on significant move
                 self.l.structure_break[0] = -1
-                # Reset bullish counts
-                self._hh_count = 0
-                self._hl_count = 0
+                # Only reset if we had a significant bullish structure
+                if self._hh_count >= 2 and self._hl_count >= 2:
+                    self._hh_count = max(0, self._hh_count - 1)
+                    self._hl_count = max(0, self._hl_count - 1)
 
-        # Bullish structure break: Close above last swing high
+        # Bullish structure break: Close significantly above last swing high
         if self._last_swing_high is not None:
-            if current_close > self._last_swing_high:
+            break_pct = (current_close - self._last_swing_high) / self._last_swing_high
+            if break_pct > threshold:  # Only break on significant move
                 self.l.structure_break[0] = 1
-                # Reset bearish counts
-                self._lh_count = 0
-                self._ll_count = 0
+                # Only reset if we had a significant bearish structure
+                if self._lh_count >= 2 and self._ll_count >= 2:
+                    self._lh_count = max(0, self._lh_count - 1)
+                    self._ll_count = max(0, self._ll_count - 1)
 
     def _set_output_lines(self):
         """Set output lines with current state"""
