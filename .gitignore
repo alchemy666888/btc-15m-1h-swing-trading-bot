@@ -36,6 +36,8 @@ env/
 # Data files (cached)
 data/*.csv
 data/*.pkl
+data/raw/
+data/processed/
 
 # Reports (generated)
 reports/*.html

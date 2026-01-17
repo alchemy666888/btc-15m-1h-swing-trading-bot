@@ -1,117 +1,179 @@
 """
 Multi-timeframe Swing Trading Strategy for Backtrader
-Implements both bullish (long) and bearish (short) setups
+
+Main strategy class that orchestrates:
+- HTF (1H) trend filtering
+- LTF (15min) entry triggers
+- Risk-based position sizing
+- Trade management (SL/TP)
 """
 import backtrader as bt
-import numpy as np
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-import config
+import yaml
+from datetime import datetime
+from typing import Optional, List
+from dataclasses import dataclass, field
+
+from src.indicators.macd_analyzer import MACDAnalyzer
+from src.indicators.structure import StructureAnalyzer
+from src.indicators.order_blocks import OrderBlockAnalyzer
+from src.strategy.htf_filter import HTFFilter, HTFState
+from src.strategy.ltf_trigger import LTFTrigger, EntrySignal
+from src.risk.position_sizer import PositionSizer
 
 
-class SwingTradingStrategy(bt.Strategy):
+@dataclass
+class TradeRecord:
+    """Container for trade log entries"""
+    entry_datetime: datetime
+    exit_datetime: Optional[datetime] = None
+    direction: str = ""  # 'long' or 'short'
+    entry_price: float = 0.0
+    exit_price: float = 0.0
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    size: float = 0.0
+    notional_value: float = 0.0
+    pnl: float = 0.0
+    pnl_pct: float = 0.0
+    r_multiple: float = 0.0
+    exit_reason: str = ""  # 'stop_loss', 'take_profit', 'invalidation', 'manual'
+    htf_state: str = ""
+    macd_at_entry: float = 0.0
+
+
+class SwingStrategy(bt.Strategy):
     """
-    Multi-timeframe swing trading strategy for crypto perpetual futures.
+    Multi-timeframe swing trading strategy.
 
-    Entry Conditions (Long):
-    - Higher TF: Bullish structure (HH/HL), MACD cross up or bullish divergence
-    - Lower TF: Bullish BOS, price at support zone or bullish FVG
-    - Confirmation: Volume > average, RSI not overbought
+    Data Feeds Expected:
+    - data0: 15min (primary LTF)
+    - data1: 1H (HTF)
+    - data2: Daily (for Order Blocks)
 
-    Entry Conditions (Short):
-    - Higher TF: Bearish structure (LH/LL), MACD cross down or bearish divergence
-    - Lower TF: Bearish BOS, price at resistance zone or bearish FVG
-    - Confirmation: Volume > average, RSI not oversold
+    Entry Logic:
+    1. HTF (1H) validates trend direction
+    2. LTF (15min) generates entry trigger
+    3. Risk-based position sizing
+
+    Exit Logic:
+    1. Stop loss hit
+    2. Take profit hit
+    3. Structure invalidation
+    4. Opposing HTF signal
     """
 
     params = (
-        # Risk Management
-        ('risk_per_trade', config.RISK_PER_TRADE),
-        ('leverage', config.LEVERAGE),
-        ('risk_reward', config.RISK_REWARD_TARGET),
-        ('atr_sl_mult', config.ATR_SL_MULTIPLIER),
-
-        # Indicator Parameters
-        ('ema_fast', config.EMA_FAST),
-        ('ema_slow', config.EMA_SLOW),
-        ('ema_trend', config.EMA_TREND),
-        ('macd_fast', config.MACD_FAST),
-        ('macd_slow', config.MACD_SLOW),
-        ('macd_signal', config.MACD_SIGNAL),
-        ('rsi_period', config.RSI_PERIOD),
-        ('rsi_overbought', config.RSI_OVERBOUGHT),
-        ('rsi_oversold', config.RSI_OVERSOLD),
-        ('atr_period', config.ATR_PERIOD),
-
-        # Swing Detection
-        ('swing_lookback', config.SWING_LOOKBACK),
-        ('break_threshold', config.BREAK_THRESHOLD),
-        ('volume_mult', config.VOLUME_MULTIPLIER),
-
-        # Trading Fees
-        ('commission', config.TAKER_FEE),
-        ('slippage', config.SLIPPAGE),
+        ('config_path', 'config/parameters.yaml'),
+        ('printlog', True),
     )
 
     def __init__(self):
+        # Load configuration
+        with open(self.p.config_path, 'r') as f:
+            self.config = yaml.safe_load(f)
+
+        # Initialize position sizer
+        self.position_sizer = PositionSizer(self.p.config_path)
+
+        # Initialize HTF filter and LTF trigger
+        self.htf_filter = HTFFilter(self.p.config_path)
+        self.ltf_trigger = LTFTrigger(self.p.config_path)
+
         # Data references
-        self.data_close = self.datas[0].close
-        self.data_high = self.datas[0].high
-        self.data_low = self.datas[0].low
-        self.data_volume = self.datas[0].volume
+        self.data_ltf = self.datas[0]  # 15min
+        self.data_htf = self.datas[1] if len(self.datas) > 1 else self.datas[0]  # 1H
+        self.data_daily = self.datas[2] if len(self.datas) > 2 else self.data_htf  # Daily
 
-        # Higher timeframe reference (if available)
-        self.htf_data = self.datas[1] if len(self.datas) > 1 else self.datas[0]
-
-        # Technical Indicators - Lower Timeframe
-        self.ema_fast = bt.indicators.EMA(self.data_close, period=self.p.ema_fast)
-        self.ema_slow = bt.indicators.EMA(self.data_close, period=self.p.ema_slow)
-        self.ema_trend = bt.indicators.EMA(self.data_close, period=self.p.ema_trend)
-
-        self.macd = bt.indicators.MACD(
-            self.data_close,
-            period_me1=self.p.macd_fast,
-            period_me2=self.p.macd_slow,
-            period_signal=self.p.macd_signal
+        # LTF Indicators (15min)
+        self.ltf_macd = MACDAnalyzer(
+            self.data_ltf,
+            fast_period=self.config['macd']['fast_period'],
+            slow_period=self.config['macd']['slow_period'],
+            signal_period=self.config['macd']['signal_period'],
+            histogram_seq_min=self.config['macd']['histogram_sequence_min'],
+            histogram_seq_max=self.config['macd']['histogram_sequence_max'],
+            magnitude_threshold=self.config['macd']['magnitude_change_threshold'],
         )
 
-        self.rsi = bt.indicators.RSI(self.data_close, period=self.p.rsi_period)
-        self.atr = bt.indicators.ATR(self.datas[0], period=self.p.atr_period)
-
-        self.volume_sma = bt.indicators.SMA(self.data_volume, period=20)
-
-        # Higher Timeframe Indicators
-        self.htf_ema_fast = bt.indicators.EMA(self.htf_data.close, period=self.p.ema_fast)
-        self.htf_ema_slow = bt.indicators.EMA(self.htf_data.close, period=self.p.ema_slow)
-        self.htf_macd = bt.indicators.MACD(
-            self.htf_data.close,
-            period_me1=self.p.macd_fast,
-            period_me2=self.p.macd_slow,
-            period_signal=self.p.macd_signal
+        self.ltf_structure = StructureAnalyzer(
+            self.data_ltf,
+            lookback=self.config['structure']['ltf_lookback'],
+            threshold=self.config['structure']['ltf_threshold'],
+            consecutive_req=self.config['structure']['ltf_consecutive_required'],
         )
-        self.htf_rsi = bt.indicators.RSI(self.htf_data.close, period=self.p.rsi_period)
 
-        # Swing point tracking
-        self.swing_highs = []
-        self.swing_lows = []
-        self.last_swing_high = None
-        self.last_swing_low = None
+        self.ltf_ob = OrderBlockAnalyzer(
+            self.data_ltf,
+            consolidation_bars=self.config['order_blocks']['consolidation_bars'],
+            range_threshold=self.config['order_blocks']['range_threshold'],
+            breakout_threshold=self.config['order_blocks']['breakout_threshold'],
+            buffer=self.config['order_blocks']['buffer'],
+            max_age_bars=self.config['order_blocks']['max_age_bars'],
+        )
 
-        # Trade tracking
+        # HTF Indicators (1H)
+        self.htf_macd = MACDAnalyzer(
+            self.data_htf,
+            fast_period=self.config['macd']['fast_period'],
+            slow_period=self.config['macd']['slow_period'],
+            signal_period=self.config['macd']['signal_period'],
+        )
+
+        self.htf_structure = StructureAnalyzer(
+            self.data_htf,
+            lookback=self.config['structure']['htf_lookback'],
+            threshold=self.config['structure']['htf_threshold'],
+            consecutive_req=self.config['structure']['htf_consecutive_required'],
+        )
+
+        # Daily OB Analyzer
+        self.daily_ob = OrderBlockAnalyzer(
+            self.data_daily,
+            consolidation_bars=self.config['order_blocks']['consolidation_bars'],
+            range_threshold=self.config['order_blocks']['range_threshold'],
+            breakout_threshold=self.config['order_blocks']['breakout_threshold'],
+        )
+
+        # Volume MA for confirmation
+        self.volume_ma = bt.indicators.SMA(
+            self.data_ltf.volume,
+            period=self.config['filters']['volume_ma_period']
+        )
+
+        # ATR for volatility filter
+        self.atr = bt.indicators.ATR(
+            self.data_ltf,
+            period=self.config['filters']['atr_period']
+        )
+        self.atr_ma = bt.indicators.SMA(
+            self.atr,
+            period=self.config['filters']['atr_period'] * 2
+        )
+
+        # Track HTF bar count for detecting new 1H bar
+        self._htf_bar_count = 0
+
+        # Order tracking
         self.order = None
+        self.stop_order = None
+        self.tp_order = None
+
+        # Position tracking
         self.entry_price = None
         self.stop_loss = None
         self.take_profit = None
-        self.trade_direction = None  # 'long' or 'short'
+        self.trade_direction = None
+        self.position_size = None
+        self.current_trade: Optional[TradeRecord] = None
 
-        # Trade log for reporting
-        self.trade_log = []
+        # Trade log
+        self.trade_log: List[TradeRecord] = []
 
     def log(self, txt, dt=None):
         """Logging function"""
-        dt = dt or self.datas[0].datetime.date(0)
-        # print(f'{dt.isoformat()} {txt}')
+        if self.p.printlog:
+            dt = dt or self.data_ltf.datetime.datetime(0)
+            print(f'{dt.isoformat()} {txt}')
 
     def notify_order(self, order):
         """Handle order notifications"""
@@ -120,243 +182,288 @@ class SwingTradingStrategy(bt.Strategy):
 
         if order.status in [order.Completed]:
             if order.isbuy():
-                self.log(f'BUY EXECUTED, Price: {order.executed.price:.2f}')
+                self.log(f'BUY EXECUTED @ {order.executed.price:.2f}')
             else:
-                self.log(f'SELL EXECUTED, Price: {order.executed.price:.2f}')
+                self.log(f'SELL EXECUTED @ {order.executed.price:.2f}')
+
+            # Track entry
+            if self.order == order:
+                self.entry_price = order.executed.price
+                self.order = None
 
         elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log('Order Canceled/Margin/Rejected')
-
-        self.order = None
+            self.log(f'Order Canceled/Margin/Rejected: {order.status}')
+            self.order = None
 
     def notify_trade(self, trade):
         """Handle trade notifications"""
         if not trade.isclosed:
             return
 
-        trade_info = {
-            'entry_date': bt.num2date(trade.dtopen),
-            'exit_date': bt.num2date(trade.dtclose),
-            'direction': self.trade_direction,
-            'entry_price': trade.price,
-            'exit_price': self.data_close[0],
-            'pnl': trade.pnl,
-            'pnl_pct': (trade.pnl / trade.price) * 100,
-            'size': abs(trade.size),
-        }
-        self.trade_log.append(trade_info)
+        # Record trade results
+        if self.current_trade:
+            self.current_trade.exit_datetime = self.data_ltf.datetime.datetime(0)
+            self.current_trade.exit_price = trade.price
+            self.current_trade.pnl = trade.pnl
+            self.current_trade.pnl_pct = (trade.pnl / self.entry_price) * 100 if self.entry_price else 0
 
-        self.log(f'TRADE CLOSED - PnL: {trade.pnl:.2f} ({trade_info["pnl_pct"]:.2f}%)')
+            # Calculate R-multiple
+            if self.stop_loss and self.entry_price:
+                self.current_trade.r_multiple = self.position_sizer.calculate_r_multiple(
+                    self.entry_price,
+                    trade.price,
+                    self.stop_loss,
+                    self.current_trade.direction
+                )
 
-    def update_swing_points(self):
-        """Update swing highs and lows"""
-        lookback = self.p.swing_lookback
+            self.trade_log.append(self.current_trade)
 
-        if len(self.data_close) < lookback * 2 + 1:
-            return
+            self.log(f'TRADE CLOSED - PnL: ${trade.pnl:.2f} ({self.current_trade.pnl_pct:.2f}%) R: {self.current_trade.r_multiple:.2f}')
 
-        # Check for swing high
-        current_idx = len(self.data_close) - lookback - 1
-        is_swing_high = True
-        is_swing_low = True
-
-        center_high = self.data_high[-lookback - 1]
-        center_low = self.data_low[-lookback - 1]
-
-        for i in range(-lookback * 2, 0):
-            if i == -lookback - 1:
-                continue
-            if self.data_high[i] >= center_high:
-                is_swing_high = False
-            if self.data_low[i] <= center_low:
-                is_swing_low = False
-
-        if is_swing_high:
-            self.swing_highs.append({
-                'price': center_high,
-                'bar': len(self.data_close) - lookback - 1
-            })
-            self.last_swing_high = center_high
-
-        if is_swing_low:
-            self.swing_lows.append({
-                'price': center_low,
-                'bar': len(self.data_close) - lookback - 1
-            })
-            self.last_swing_low = center_low
-
-    def check_bullish_setup(self):
-        """Check for bullish (long) entry conditions"""
-        if len(self.data_close) < 50:
-            return False
-
-        # Higher TF conditions
-        htf_bullish_trend = self.htf_ema_fast[0] > self.htf_ema_slow[0]
-        htf_macd_bullish = self.htf_macd.macd[0] > self.htf_macd.signal[0]
-
-        # Lower TF conditions
-        ltf_ema_bullish = self.ema_fast[0] > self.ema_slow[0]
-        ltf_macd_cross_up = (self.macd.macd[0] > self.macd.signal[0] and
-                             self.macd.macd[-1] <= self.macd.signal[-1])
-
-        # RSI condition (not overbought)
-        rsi_ok = self.rsi[0] < self.p.rsi_overbought
-
-        # Volume confirmation
-        volume_ok = self.data_volume[0] > self.volume_sma[0] * self.p.volume_mult * 0.8
-
-        # Support zone check (price near recent swing low)
-        at_support = False
-        if self.last_swing_low is not None:
-            distance_to_support = (self.data_close[0] - self.last_swing_low) / self.data_close[0]
-            at_support = distance_to_support < 0.02  # Within 2% of support
-
-        # Bullish BOS (Break of Structure)
-        bullish_bos = False
-        if self.last_swing_high is not None and len(self.swing_highs) > 1:
-            if self.data_close[0] > self.last_swing_high and self.data_close[-1] <= self.last_swing_high:
-                bullish_bos = True
-
-        # Combined conditions
-        htf_ok = htf_bullish_trend or htf_macd_bullish
-        ltf_ok = ltf_ema_bullish or ltf_macd_cross_up
-        entry_trigger = at_support or bullish_bos
-
-        return htf_ok and ltf_ok and rsi_ok and (volume_ok or entry_trigger)
-
-    def check_bearish_setup(self):
-        """Check for bearish (short) entry conditions"""
-        if len(self.data_close) < 50:
-            return False
-
-        # Higher TF conditions
-        htf_bearish_trend = self.htf_ema_fast[0] < self.htf_ema_slow[0]
-        htf_macd_bearish = self.htf_macd.macd[0] < self.htf_macd.signal[0]
-
-        # Lower TF conditions
-        ltf_ema_bearish = self.ema_fast[0] < self.ema_slow[0]
-        ltf_macd_cross_down = (self.macd.macd[0] < self.macd.signal[0] and
-                               self.macd.macd[-1] >= self.macd.signal[-1])
-
-        # RSI condition (not oversold)
-        rsi_ok = self.rsi[0] > self.p.rsi_oversold
-
-        # Volume confirmation
-        volume_ok = self.data_volume[0] > self.volume_sma[0] * self.p.volume_mult * 0.8
-
-        # Resistance zone check (price near recent swing high)
-        at_resistance = False
-        if self.last_swing_high is not None:
-            distance_to_resistance = (self.last_swing_high - self.data_close[0]) / self.data_close[0]
-            at_resistance = distance_to_resistance < 0.02  # Within 2% of resistance
-
-        # Bearish BOS (Break of Structure)
-        bearish_bos = False
-        if self.last_swing_low is not None and len(self.swing_lows) > 1:
-            if self.data_close[0] < self.last_swing_low and self.data_close[-1] >= self.last_swing_low:
-                bearish_bos = True
-
-        # Combined conditions
-        htf_ok = htf_bearish_trend or htf_macd_bearish
-        ltf_ok = ltf_ema_bearish or ltf_macd_cross_down
-        entry_trigger = at_resistance or bearish_bos
-
-        return htf_ok and ltf_ok and rsi_ok and (volume_ok or entry_trigger)
-
-    def calculate_position_size(self, stop_distance):
-        """Calculate position size based on risk management"""
-        account_value = self.broker.getvalue()
-        risk_amount = account_value * self.p.risk_per_trade
-
-        # Position size = Risk Amount / Stop Distance
-        if stop_distance > 0:
-            position_size = risk_amount / stop_distance
-            # Apply leverage
-            max_position = (account_value * self.p.leverage) / self.data_close[0]
-            position_size = min(position_size, max_position)
-            return position_size
-        return 0
+        # Reset tracking
+        self.current_trade = None
+        self.entry_price = None
+        self.stop_loss = None
+        self.take_profit = None
+        self.trade_direction = None
 
     def next(self):
-        """Main strategy logic executed on each bar"""
-        # Update swing points
-        self.update_swing_points()
+        """Main strategy logic executed on each 15min bar"""
+        # Check if new HTF bar closed
+        htf_bar_closed = len(self.data_htf) > self._htf_bar_count
+        if htf_bar_closed:
+            self._htf_bar_count = len(self.data_htf)
+            self._update_htf_filter()
 
-        # Skip if we have a pending order
+        # Skip if pending order
         if self.order:
             return
 
-        # Check if we have a position
-        if not self.position:
-            # Look for entry signals
-            if self.check_bullish_setup():
-                self.enter_long()
-            elif self.check_bearish_setup():
-                self.enter_short()
+        # Get current state
+        current_price = self.data_ltf.close[0]
+        current_volume = self.data_ltf.volume[0]
+        volume_ma = self.volume_ma[0]
+
+        # Check volatility filter
+        if self._is_high_volatility():
+            return
+
+        # Manage existing position
+        if self.position:
+            self._manage_position(current_price)
         else:
-            # Manage existing position
-            self.manage_position()
+            # Look for new entry
+            self._check_entry(current_price, current_volume, volume_ma)
 
-    def enter_long(self):
-        """Enter a long position"""
-        atr = self.atr[0]
-        stop_distance = atr * self.p.atr_sl_mult
+    def _update_htf_filter(self):
+        """Update HTF filter on 1H bar close"""
+        current_price = self.data_htf.close[0]
+        structure_break = self.htf_structure.l.structure_break[0] != 0
 
+        self.htf_filter.update(
+            structure_analyzer=self.htf_structure,
+            order_block_analyzer=self.daily_ob,
+            macd_analyzer=self.htf_macd,
+            current_price=current_price,
+            structure_break=structure_break
+        )
+
+    def _is_high_volatility(self) -> bool:
+        """Check if current volatility is too high"""
+        if len(self.atr) < 2 or len(self.atr_ma) < 1:
+            return False
+
+        multiplier = self.config['filters']['high_volatility_multiplier']
+        return self.atr[0] > self.atr_ma[0] * multiplier
+
+    def _check_entry(self, current_price: float, volume: float, volume_ma: float):
+        """Check for entry signals"""
+        # Get HTF state
+        htf_state = None
+        if self.htf_filter.is_bullish:
+            htf_state = 'bullish'
+        elif self.htf_filter.is_bearish:
+            htf_state = 'bearish'
+
+        if htf_state is None:
+            return
+
+        # Check LTF trigger
+        signal = self.ltf_trigger.check_entry(
+            htf_state=htf_state,
+            structure_analyzer=self.ltf_structure,
+            macd_analyzer=self.ltf_macd,
+            order_block_analyzer=self.ltf_ob,
+            current_price=current_price,
+            volume=volume,
+            volume_ma=volume_ma
+        )
+
+        if signal == EntrySignal.LONG:
+            self._enter_long(current_price)
+        elif signal == EntrySignal.SHORT:
+            self._enter_short(current_price)
+
+    def _enter_long(self, current_price: float):
+        """Execute long entry"""
         # Calculate stop loss and take profit
-        self.entry_price = self.data_close[0]
-        self.stop_loss = self.entry_price - stop_distance
-        self.take_profit = self.entry_price + (stop_distance * self.p.risk_reward)
+        stop_loss = self.ltf_trigger.calculate_stop_loss(
+            'long', self.ltf_structure, self.ltf_ob, current_price
+        )
+        take_profit = self.ltf_trigger.calculate_take_profit(
+            'long', self.htf_structure, current_price
+        )
 
         # Calculate position size
-        size = self.calculate_position_size(stop_distance)
+        account_value = self.broker.getvalue()
+        pos_size = self.position_sizer.calculate_position_size(
+            account_value, current_price, stop_loss
+        )
 
-        if size > 0:
-            self.log(f'LONG ENTRY Signal - Price: {self.entry_price:.2f}, SL: {self.stop_loss:.2f}, TP: {self.take_profit:.2f}')
-            self.order = self.buy(size=size)
-            self.trade_direction = 'long'
+        if pos_size.size <= 0:
+            return
 
-    def enter_short(self):
-        """Enter a short position"""
-        atr = self.atr[0]
-        stop_distance = atr * self.p.atr_sl_mult
+        # Store trade info
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.trade_direction = 'long'
+        self.position_size = pos_size.size
 
+        # Create trade record
+        self.current_trade = TradeRecord(
+            entry_datetime=self.data_ltf.datetime.datetime(0),
+            direction='long',
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            size=pos_size.size,
+            notional_value=pos_size.notional_value,
+            htf_state=self.htf_filter.get_state_string(),
+            macd_at_entry=self.ltf_macd.l.macd[0]
+        )
+
+        self.log(f'LONG SIGNAL - Entry: {current_price:.2f}, SL: {stop_loss:.2f}, TP: {take_profit:.2f}, Size: {pos_size.size:.4f}')
+
+        # Execute entry
+        self.order = self.buy(size=pos_size.size)
+
+    def _enter_short(self, current_price: float):
+        """Execute short entry"""
         # Calculate stop loss and take profit
-        self.entry_price = self.data_close[0]
-        self.stop_loss = self.entry_price + stop_distance
-        self.take_profit = self.entry_price - (stop_distance * self.p.risk_reward)
+        stop_loss = self.ltf_trigger.calculate_stop_loss(
+            'short', self.ltf_structure, self.ltf_ob, current_price
+        )
+        take_profit = self.ltf_trigger.calculate_take_profit(
+            'short', self.htf_structure, current_price
+        )
 
         # Calculate position size
-        size = self.calculate_position_size(stop_distance)
+        account_value = self.broker.getvalue()
+        pos_size = self.position_sizer.calculate_position_size(
+            account_value, current_price, stop_loss
+        )
 
-        if size > 0:
-            self.log(f'SHORT ENTRY Signal - Price: {self.entry_price:.2f}, SL: {self.stop_loss:.2f}, TP: {self.take_profit:.2f}')
-            self.order = self.sell(size=size)
-            self.trade_direction = 'short'
+        if pos_size.size <= 0:
+            return
 
-    def manage_position(self):
-        """Manage existing position - check SL/TP"""
-        current_price = self.data_close[0]
+        # Store trade info
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.trade_direction = 'short'
+        self.position_size = pos_size.size
 
+        # Create trade record
+        self.current_trade = TradeRecord(
+            entry_datetime=self.data_ltf.datetime.datetime(0),
+            direction='short',
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            size=pos_size.size,
+            notional_value=pos_size.notional_value,
+            htf_state=self.htf_filter.get_state_string(),
+            macd_at_entry=self.ltf_macd.l.macd[0]
+        )
+
+        self.log(f'SHORT SIGNAL - Entry: {current_price:.2f}, SL: {stop_loss:.2f}, TP: {take_profit:.2f}, Size: {pos_size.size:.4f}')
+
+        # Execute entry
+        self.order = self.sell(size=pos_size.size)
+
+    def _manage_position(self, current_price: float):
+        """Manage open position - check SL/TP and invalidation"""
         if self.trade_direction == 'long':
             # Check stop loss
             if current_price <= self.stop_loss:
-                self.log(f'LONG STOP LOSS HIT - Price: {current_price:.2f}')
+                self.log(f'LONG STOP LOSS HIT @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'stop_loss'
                 self.order = self.close()
+                return
+
             # Check take profit
-            elif current_price >= self.take_profit:
-                self.log(f'LONG TAKE PROFIT HIT - Price: {current_price:.2f}')
+            if current_price >= self.take_profit:
+                self.log(f'LONG TAKE PROFIT HIT @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'take_profit'
                 self.order = self.close()
+                return
+
+            # Check structure invalidation
+            if self.ltf_structure.l.structure_break[0] == -1:
+                self.log(f'LONG STRUCTURE INVALIDATED @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'invalidation'
+                self.order = self.close()
+                return
+
+            # Check opposing HTF signal
+            if self.htf_filter.is_bearish:
+                self.log(f'HTF TURNED BEARISH - Closing Long @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'htf_reversal'
+                self.order = self.close()
+                return
 
         elif self.trade_direction == 'short':
             # Check stop loss
             if current_price >= self.stop_loss:
-                self.log(f'SHORT STOP LOSS HIT - Price: {current_price:.2f}')
+                self.log(f'SHORT STOP LOSS HIT @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'stop_loss'
                 self.order = self.close()
+                return
+
             # Check take profit
-            elif current_price <= self.take_profit:
-                self.log(f'SHORT TAKE PROFIT HIT - Price: {current_price:.2f}')
+            if current_price <= self.take_profit:
+                self.log(f'SHORT TAKE PROFIT HIT @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'take_profit'
                 self.order = self.close()
+                return
+
+            # Check structure invalidation
+            if self.ltf_structure.l.structure_break[0] == 1:
+                self.log(f'SHORT STRUCTURE INVALIDATED @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'invalidation'
+                self.order = self.close()
+                return
+
+            # Check opposing HTF signal
+            if self.htf_filter.is_bullish:
+                self.log(f'HTF TURNED BULLISH - Closing Short @ {current_price:.2f}')
+                if self.current_trade:
+                    self.current_trade.exit_reason = 'htf_reversal'
+                self.order = self.close()
+                return
 
     def stop(self):
         """Called when backtest ends"""
-        self.log(f'Final Portfolio Value: {self.broker.getvalue():.2f}')
+        final_value = self.broker.getvalue()
+        initial_value = self.config['general']['initial_capital']
+        total_return = ((final_value - initial_value) / initial_value) * 100
+
+        self.log(f'Final Portfolio Value: ${final_value:.2f}')
+        self.log(f'Total Return: {total_return:.2f}%')
+        self.log(f'Total Trades: {len(self.trade_log)}')
