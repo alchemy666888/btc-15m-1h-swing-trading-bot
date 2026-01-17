@@ -19,17 +19,124 @@ def load_config(config_path: str = "config/parameters.yaml") -> Dict:
         return yaml.safe_load(f)
 
 
+class SyntheticDataGenerator:
+    """Generates realistic synthetic BTC price data for testing"""
+
+    @staticmethod
+    def generate(
+        start_date: str = "2025-01-01",
+        end_date: str = "2025-12-31",
+        timeframe: str = "15m",
+        initial_price: float = 95000.0
+    ) -> pd.DataFrame:
+        """
+        Generate synthetic OHLCV data with realistic price movements.
+
+        Args:
+            start_date: Start date string (YYYY-MM-DD)
+            end_date: End date string (YYYY-MM-DD)
+            timeframe: Candle timeframe ('15m' or '1h')
+            initial_price: Starting price
+
+        Returns:
+            DataFrame with timestamp, open, high, low, close, volume
+        """
+        # Parse dates
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        end = datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Calculate number of candles
+        if timeframe == "15m":
+            freq = "15min"
+            candle_volatility = 0.003  # 0.3% per candle
+        elif timeframe == "1h":
+            freq = "1h"
+            candle_volatility = 0.006  # 0.6% per candle
+        else:
+            freq = "1h"
+            candle_volatility = 0.006
+
+        timestamps = pd.date_range(start=start, end=end, freq=freq)
+        n_candles = len(timestamps)
+
+        print(f"Generating {n_candles} synthetic {timeframe} candles...")
+
+        # Generate price series with mean reversion and trends
+        np.random.seed(42)  # For reproducibility
+        prices = [initial_price]
+        mean_price = initial_price
+
+        for i in range(1, n_candles):
+            # Random component
+            random_return = np.random.normal(0, candle_volatility)
+
+            # Mean reversion
+            deviation = (prices[-1] - mean_price) / mean_price
+            mean_reversion = -0.05 * deviation
+
+            # Momentum (trending behavior)
+            if i > 10:
+                recent_returns = [(prices[j] - prices[j-1]) / prices[j-1] for j in range(max(1, i-10), i)]
+                momentum = 0.1 * np.mean(recent_returns) if recent_returns else 0
+            else:
+                momentum = 0
+
+            total_return = random_return + mean_reversion + momentum
+            new_price = prices[-1] * (1 + total_return)
+            mean_price = 0.999 * mean_price + 0.001 * new_price
+            prices.append(new_price)
+
+        prices = np.array(prices)
+
+        # Generate OHLC
+        opens = prices.copy()
+        closes = prices.copy()
+        highs = []
+        lows = []
+
+        for i in range(n_candles):
+            intra_vol = abs(np.random.normal(0, candle_volatility * 0.5))
+            high = max(opens[i], closes[i]) * (1 + intra_vol)
+            low = min(opens[i], closes[i]) * (1 - intra_vol)
+            highs.append(high)
+            lows.append(low)
+
+        # Generate volume
+        base_volume = 5000
+        volumes = []
+        for i in range(n_candles):
+            price_change = abs(closes[i] - opens[i]) / opens[i] if opens[i] > 0 else 0
+            vol_multiplier = 1 + price_change * 50
+            volume = base_volume * vol_multiplier * np.random.uniform(0.5, 2.0)
+            volumes.append(volume)
+
+        df = pd.DataFrame({
+            'timestamp': timestamps,
+            'open': opens,
+            'high': highs,
+            'low': lows,
+            'close': closes,
+            'volume': volumes
+        })
+
+        return df
+
+
 class DataLoader:
     """
     Data loader for BTC swing trading backtester.
 
     Loads CSV data from raw folder and prepares multi-timeframe feeds.
+    Generates synthetic data if no CSV files are found.
     """
 
     def __init__(self, config_path: str = "config/parameters.yaml"):
         self.config = load_config(config_path)
         self.raw_data_path = self.config['paths']['raw_data']
         self.processed_data_path = self.config['paths']['processed_data']
+
+        # Create directories if they don't exist
+        os.makedirs(self.raw_data_path, exist_ok=True)
         os.makedirs(self.processed_data_path, exist_ok=True)
 
     def load_csv(self, filepath: str) -> pd.DataFrame:
@@ -69,12 +176,13 @@ class DataLoader:
     def load_primary_data(self) -> pd.DataFrame:
         """
         Load primary (15min) timeframe data.
+        Generates synthetic data if no CSV file is found.
 
         Returns:
             DataFrame with 15min OHLCV data
         """
         # Look for 15m data file
-        files = os.listdir(self.raw_data_path)
+        files = os.listdir(self.raw_data_path) if os.path.exists(self.raw_data_path) else []
         ltf_file = None
 
         for f in files:
@@ -83,7 +191,18 @@ class DataLoader:
                 break
 
         if ltf_file is None:
-            raise FileNotFoundError(f"No 15min data file found in {self.raw_data_path}")
+            print(f"No 15min data file found in {self.raw_data_path}")
+            print("Generating synthetic 15min data...")
+            start_date = self.config['general']['start_date']
+            end_date = self.config['general']['end_date']
+            df = SyntheticDataGenerator.generate(start_date, end_date, "15m")
+
+            # Save for future use
+            filename = f"BTC_USDT_15m_{start_date.replace('-', '')}_{end_date.replace('-', '')}.csv"
+            filepath = os.path.join(self.raw_data_path, filename)
+            df.to_csv(filepath, index=False)
+            print(f"Saved synthetic data to: {filepath}")
+            return df
 
         print(f"Loading primary data from: {ltf_file}")
         df = self.load_csv(ltf_file)
@@ -94,12 +213,13 @@ class DataLoader:
     def load_htf_data(self) -> pd.DataFrame:
         """
         Load higher timeframe (1H) data.
+        Generates synthetic data if no CSV file is found.
 
         Returns:
             DataFrame with 1H OHLCV data
         """
         # Look for 1h data file
-        files = os.listdir(self.raw_data_path)
+        files = os.listdir(self.raw_data_path) if os.path.exists(self.raw_data_path) else []
         htf_file = None
 
         for f in files:
@@ -108,7 +228,18 @@ class DataLoader:
                 break
 
         if htf_file is None:
-            raise FileNotFoundError(f"No 1H data file found in {self.raw_data_path}")
+            print(f"No 1H data file found in {self.raw_data_path}")
+            print("Generating synthetic 1H data...")
+            start_date = self.config['general']['start_date']
+            end_date = self.config['general']['end_date']
+            df = SyntheticDataGenerator.generate(start_date, end_date, "1h")
+
+            # Save for future use
+            filename = f"BTC_USDT_1h_{start_date.replace('-', '')}_{end_date.replace('-', '')}.csv"
+            filepath = os.path.join(self.raw_data_path, filename)
+            df.to_csv(filepath, index=False)
+            print(f"Saved synthetic data to: {filepath}")
+            return df
 
         print(f"Loading HTF data from: {htf_file}")
         df = self.load_csv(htf_file)
